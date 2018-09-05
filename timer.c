@@ -1,27 +1,39 @@
 #define _GNU_SOURCE
 
+#include <arpa/inet.h>
+#include <assert.h>
+#include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <ltc.h>
+#include <math.h>
+#include <netinet/in.h>
+#include <pthread.h>
+#include <sched.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/timex.h>
 #include <sys/types.h>
 #include <string.h>
-#include <assert.h>
-#include <sched.h>
 #include <stdbool.h>
 #include <stdlib.h>
-#include <unistd.h>
-#include <pthread.h>
-#include <stdio.h>
-#include <math.h>
+#include <sys/types.h>
+#include <sys/socket.h>
 #include <time.h>
-#include <sys/timex.h>
+#include <unistd.h>
+#include <unistd.h>
 #include <wiringPi.h>
-#include <ncurses.h>
-#include <signal.h>
-#include <ltc.h>
 #include "ringbuf.h"
+#include "log.h"
+#include "timef.h"
 
 #define SIG SIGRTMIN
-#define errExit(msg)		do { perror(msg); exit(EXIT_FAILURE); } while (0);
+#define errExit(msg)		do { log_error(msg); exit(EXIT_FAILURE); } while (0);
 
-
+#define LTC_ANNOUNCE_PORT 49878
 /*
  *
  * this version of the timer uses a separate thread for the LTC encoder which is
@@ -49,13 +61,63 @@ SMPTETimecode 	smpte;
 LTCEncoder 	*encoder;
 SMPTETimecode 	st;
 
+struct sockaddr_in app_addr;
+int app_addrlen, app_sock;
+struct in_addr app_in_addr;
 
+void setupLTCAnnounceSocket() {
+	/* set up socket */
+	app_sock = socket(AF_INET, SOCK_DGRAM, 0);
+	int broadcastEnable=1;
+	int ret=setsockopt(app_sock, SOL_SOCKET, SO_BROADCAST, &broadcastEnable, sizeof(broadcastEnable));
+	if (app_sock < 0) {
+		log_error("failed to create app_socket");
+		exit(1);
+	}
+	bzero((char *)&app_addr, sizeof(app_addr));
+	app_addr.sin_family = AF_INET;
+	app_addr.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+	app_addr.sin_addr.s_addr = inet_addr("192.168.4.255");
+	app_addr.sin_port = htons(LTC_ANNOUNCE_PORT);
+	app_addrlen = sizeof(app_addr);
+}
+
+void ltc_announce() {
+	struct timespec tp;
+	uint64_t ttm;
+	char buf[1024];
+
+	clock_gettime(CLOCK_REALTIME,&tp);
+
+	struct tm ltcm;
+	time_t tt=tp.tv_sec;
+
+	localtime_r(&tt,&ltcm);
+
+	ttm=timespec_to_uint64(&tp);
+	snprintf(buf,1024,"TIMESYNC:%llu:%02u.%02u.%02u.%02u",ttm,ltcm.tm_hour,ltcm.tm_min,ltcm.tm_sec,0);
+
+	log_info("announcing presence for time: %02u:%02u:%02u:%02u",ltcm.tm_hour,ltcm.tm_min,ltcm.tm_sec,0);
+
+	if (sendto(app_sock,buf,strlen(buf),0,(struct sockaddr *) &app_addr,app_addrlen)==-1) {
+		log_error("sendto error during announce: %s",strerror(errno));
+	}
+}
 /*
  * toggle the GPIO pin depending on the sample value
  */
 void 
 setGPIOPin(volatile char * value) {
 	if ((*value)<0xA0) {
+		digitalWrite(0,LOW);
+	} else {
+		digitalWrite(0,HIGH);
+	}
+}
+
+void 
+setGPIOPin2(volatile char * value) {
+	if (!(*value)) {
 		digitalWrite(0,LOW);
 	} else {
 		digitalWrite(0,HIGH);
@@ -78,9 +140,8 @@ setGPIOPin(volatile char * value) {
 
 int edge=0;
 
-
 static void
-timer_handler(int sig, siginfo_t *si, void *uc)
+signal_handler(int sig, siginfo_t *si, void *uc)
 {
 
 	if (iOutCount == 0) {
@@ -90,7 +151,7 @@ timer_handler(int sig, siginfo_t *si, void *uc)
 		pthread_mutex_unlock(&tMutexRingBuffer);
 
 	}
-	setGPIOPin((char*)(dst + iOutCount));
+	setGPIOPin2((char*)(dst + iOutCount));
 	iOutCount = (iOutCount + 1) % 160;
 
 }
@@ -107,6 +168,8 @@ void *encoder_thread_function(void*args) {
 
 	/* 
 	 * setup CPU affinity
+	 *
+	 * get this to run on a single CPU so that there isn't any contention for resources (hopefully)
 	 */
 
 	cpu_set_t cpuset;
@@ -190,12 +253,13 @@ initialize_encoder(struct timespec * ts,int reinit) {
 
 	st.frame = 0;
 
+	log_info("TC:%02u:%02u:%02u:%02u",st.hours,st.mins,st.secs,st.frame);
+
 	if (!reinit)  {
 		encoder = ltc_encoder_create(sampleRate, fps,
 				fps==25?LTC_TV_625_50:LTC_TV_525_60, LTC_USE_DATE);
 	}
 	ltc_encoder_set_timecode(encoder, &st);
-
 }
 
 /*
@@ -236,7 +300,7 @@ void *timer_thread_function(void*args) {
 	 * Setup the signal handler
 	 */
 	sa.sa_flags = SA_SIGINFO;
-	sa.sa_sigaction = timer_handler;
+	sa.sa_sigaction = signal_handler;
 	sigemptyset(&sa.sa_mask);
 
 	if (sigaction(SIG, &sa, NULL) == -1)
@@ -315,6 +379,8 @@ void *timer_thread_function(void*args) {
 					digitalWrite(1,LOW);
 			}
 
+			ltc_announce();
+
 			framecount=0;
 			cnt_e=0;
 
@@ -334,11 +400,9 @@ void *timer_thread_function(void*args) {
 				/*
 				 * let the encoder thread know that we are ready to go
 				 */
-				printf("Waiting on the encoder\n");
+				log_info("Waiting on the encoder");
 				pthread_barrier_wait(&ptStartBarrier);
-				printf("Done waiting on the encoder\n");
-				sleep(1);
-				printf("Clock warming up...\n");
+				log_info("Done waiting on the encoder");
 				encoder_initialized=1;
 			}
 		}
@@ -354,15 +418,13 @@ void *timer_thread_function(void*args) {
 		}
 
 	}
-	endwin();
 }
 
 
 int
 main (int argc, char *argv[]) {
-	printf("NTP2LTC Timecode Generator v0.1 alpha\n");
-	printf("Greenside Productions 2018...\n");
-	printf("Configuring...\n");
+	log_info("NTP2LTC Timecode Generator v0.1 alpha");
+	log_info("Greenside Productions 2018...");
 
 	/*
 	 * buffer setup
@@ -393,6 +455,12 @@ main (int argc, char *argv[]) {
 	 * Set up the mutex
 	 */
 	pthread_mutex_init(&tMutexRingBuffer,NULL);
+
+	/*
+	 * Setup Announcement Socket
+	 */
+
+	setupLTCAnnounceSocket() ;
 
 	/*
 	 * Threads setup

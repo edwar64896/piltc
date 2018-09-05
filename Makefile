@@ -10,7 +10,7 @@ LIBS=-lm  -lrt -lpthread -lltc -lwiringPi -lncurses
 _DEPS =
 DEPS = $(patsubst %,$(IDIR)/%,$(_DEPS))
 
-_timerOBJ = timer.o ringbuf.o
+_timerOBJ = timer.o ringbuf.o log.o timef.o
 OBJ = $(patsubst %,$(ODIR)/%,$(_OBJ))
 
 
