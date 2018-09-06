@@ -5,7 +5,7 @@ CFLAGS=-I$(IDIR) -O3
 ODIR=obj
 LDIR =../lib
 
-LIBS=-lm  -lrt -lpthread -lltc -lwiringPi -lncurses
+LIBS=-lm  -lrt -lpthread -lltc -lwiringPi
 
 _DEPS =
 DEPS = $(patsubst %,$(IDIR)/%,$(_DEPS))
